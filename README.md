@@ -1,6 +1,11 @@
-# Andrew Hoang
-
 # Project 6 - Distributed Key-Value Database
+
+Contributors: Andrew Hoang
+
+Date: April 23, 2024
+
+## Description
+This project implements a distributed key-value store using the Raft consensus protocol, providing fault-tolerant replication, leader election, and strong consistency across multiple replicas.
 
 ## High Level Approach
 This project implements a simple distributed key-value store using the Raft consensus protocol. The key objectives were to ensure data consistency and fault tolerance across a cluster of replicas. The main functionalities include handling `get` and `put` operations, managing elections, and log replication to ensure strong consistency.
