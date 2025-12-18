@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+
+import argparse
+import socket
+import time
+import json
+import select
+import random
+
+# Constants
+BROADCAST = "FFFF"
+LEADER = "leader"
+CANDIDATE = "candidate"
+FOLLOWER = "follower"
+ids_of_replicas = ['0000', '0001', '0002', '0003', '0004']
+
+# class that represents kv store using the raft protocol
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+
+        # States
+        self.current_term = 0
+        self.change_log = [{'src': '', 'key': '', 'value': '', 'MID': '', 'term': 0}]
+        self.voted_for_this_term = ''
+        self.vote_count = 0
+        self.state = FOLLOWER
+        self.current_leader = BROADCAST
+        self.kv_store = {}
+        self.last_action_time = time.time()
+
+        # Network Setup
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        # initial actions
+        self.broadcast_hello_msg()
+
+    # Sends an initial "hello" message to all other replicas in the network upon starting up
+    def broadcast_hello_msg(self):
+        print("%s Replica starting up" % self.id, flush=True)
+        hello_msg = {"src": self.id, "dst": BROADCAST, LEADER: BROADCAST, "type": "hello"}
+        message_encoded = json.dumps(hello_msg).encode('utf-8')
+        self.socket.sendto(message_encoded, ('localhost', self.port))
+        print("Hello message sent: %s" % hello_msg, flush=True)
+
+    # Executes the main event loop of the replica, handling incoming messages and performing leader checks
+    def run(self):
+        while True:
+            readable, _, _ = select.select([self.socket], [], [], 0.1)
+            for sock in readable:
+                data, _ = sock.recvfrom(65535)
+                received_message = json.loads(data.decode('utf-8'))
+                if received_message['type'] == 'req_vote':
+                    self.process_vote_request(received_message)
+                elif received_message['type'] == 'vote_t':
+                    self.process_vote_confirmation(received_message)
+                elif received_message['type'] == 'vote_f':
+                    self.process_vote_rejection(received_message)
+                elif received_message['type'] == 'put':
+                    self.process_put_request(received_message)
+                elif received_message['type'] == 'get':
+                    self.process_get_request(received_message)
+                elif received_message['type'] == 'app_rpc':
+                    self.last_action_time = time.time()
+                    self.apply_replicated_entries(received_message)
+
+            # Handling timing for leader and non-leader roles
+            current_time = time.time()
+            if current_time - self.last_action_time > 0.5 and self.state == LEADER:
+                # Send append entries to all replicas to maintain leader status
+                if self.current_leader == self.id and self.state == LEADER:
+                    for id_replica in ids_of_replicas:
+                        append_entries_message = {
+                            'src': self.id,
+                            'dst': id_replica,
+                            'type': 'app_rpc',     
+                            'leader': self.current_leader,
+                            'term': self.current_term,
+                            "key": '', 
+                            "value": '' 
+                        }
+                        message_encoded = json.dumps(append_entries_message).encode('utf-8')
+                        self.socket.sendto(message_encoded, ('localhost', self.port))
+                self.last_action_time = current_time
+
+            if current_time - self.last_action_time > 3 and self.state != LEADER:
+                # Start election if not a leader and timeout is exceeded
+                self.current_term += 1
+                self.state = CANDIDATE
+                self.voted_for_this_term = self.id 
+                self.vote_count = 1  # Include own vote
+                request_vote_msg = {
+                    'src': self.id,
+                    'dst': "NULL",
+                    'leader': self.current_leader,
+                    'type': 'req_vote',
+                    'term': self.current_term,
+                    'candidate_id': self.id
+                }
+                for id_replica in ids_of_replicas:    
+                    message_copy = request_vote_msg.copy()
+                    message_copy['dst'] = id_replica
+                    self.socket.sendto(json.dumps(message_copy).encode('utf-8'), ('localhost', self.port))
+                self.last_action_time = current_time
+
+    # Processes a GET request based on the current state and leadership of the replica.
+    def process_get_request(self, get_request):
+        key = get_request['key']
+        if self.state == LEADER and self.current_leader == self.id:
+            # Prepare the base reply message
+            response_data = {
+                "src": self.id,
+                "dst": get_request['src'],
+                "leader": self.current_leader,
+                "MID": get_request['MID'],
+                "value": ''  # Default empty value if the key is not found
+            }
+        
+            if key in self.kv_store:
+                response_data['value'] = self.kv_store[key]
+                response_data['type'] = "ok"
+            else:
+                response_data['type'] = "fail"
+
+            # Serialize and send the response data directly here
+            message_encoded = json.dumps(response_data).encode('utf-8')
+            self.socket.sendto(message_encoded, ('localhost', self.port))
+        else:
+            # If not the leader, send a redirect message
+            redirect_message = {
+                "src": self.id,
+                "dst": get_request['src'],
+                "leader": self.current_leader,
+                "type": "redirect",
+                "MID": get_request['MID']
+            }
+            # Serialize and send the redirect message directly here
+            message_encoded = json.dumps(redirect_message).encode('utf-8')
+            self.socket.sendto(message_encoded, ('localhost', self.port))    
+
+    # Processes a PUT request by updating the key-value store if this replica is the leader.
+    def process_put_request(self, put_request):
+        if self.state == LEADER and self.current_leader == self.id:
+            # Update the key-value store and change log
+            self.kv_store[put_request['key']] = put_request['value']
+            self.change_log.append({
+                'src': put_request['src'],
+                'key': put_request['key'],
+                'value': put_request['value'],
+                'MID': put_request['MID'],
+                'term': self.current_term
+            })
+
+            # Create and send append entry RPCs to all followers
+            app_rpc_msg = {
+                "src": self.id, "dst": None, "leader": self.current_leader,
+                "type": "app_rpc", "MID": put_request['MID'],
+                "key": put_request['key'], "value": put_request['value']
+            }
+            for id_replica in self.others:  # Assuming 'self.others' contains all other replica IDs
+                app_rpc_msg_copy = app_rpc_msg.copy()
+                app_rpc_msg_copy['dst'] = id_replica
+                self.socket.sendto(json.dumps(app_rpc_msg_copy).encode('utf-8'), ('localhost', self.port))
+
+            # Send an OK response back to the client
+            ack_message = {
+                "src": self.id, "dst": put_request['src'], "leader": self.current_leader,
+                "type": "ok", "MID": put_request['MID']
+            }
+            self.socket.sendto(json.dumps(ack_message).encode('utf-8'), ('localhost', self.port))
+        else:
+            # Check if this replica knows who the current leader is
+            if self.current_leader == 'FFFF':
+                # Start election if no current leader is known
+                self.current_term += 1
+                self.state = CANDIDATE
+                self.voted_for_this_term = self.id
+                self.vote_count = 1  # Include own vote
+                request_vote_msg = {
+                    'src': self.id,
+                    'dst': "NULL",  # Destination will be set in the loop below
+                    'leader': self.current_leader,
+                    'type': 'req_vote',
+                    'term': self.current_term,
+                    'candidate_id': self.id,
+                }
+                # Directly sending the request vote message to all replicas
+                for id_replica in self.others:
+                    request_vote_msg_copy = request_vote_msg.copy()
+                    request_vote_msg_copy['dst'] = id_replica
+                    self.socket.sendto(json.dumps(request_vote_msg_copy).encode('utf-8'), ('localhost', self.port))
+            else:
+                # Redirect to the current leader if not the leader
+                redirect_message = {
+                    "src": self.id, "dst": put_request['src'],
+                    "leader": self.current_leader, "type": "redirect",
+                    "MID": put_request['MID']
+                }
+                self.socket.sendto(json.dumps(redirect_message).encode('utf-8'), ('localhost', self.port))
+
+    # Processes an incoming vote request based on the current state of the replica
+    def process_vote_request(self, vote_request):
+        # Prepare the base structure of the reply message
+        vote_response = {
+            'src': self.id,
+            'dst': vote_request['src'],
+            'leader': self.current_leader,
+            'type': 'Null',  # Will be set based on voting conditions below
+            'term': self.current_term
+        }
+
+        # Decide whether to grant the vote
+        if self.voted_for_this_term == '':
+            vote_response['type'] = 'vote_t'
+            self.voted_for_this_term = vote_request['src']
+        else:
+            vote_response['type'] = 'vote_f'
+
+        # Serialize and send the vote reply directly here
+        message_encoded = json.dumps(vote_response).encode('utf-8')
+        self.socket.sendto(message_encoded, ('localhost', self.port))
+
+    # Handles the confirmation of a received vote during an election cycle
+    def process_vote_confirmation(self, vote_confirmation_msg):
+        self.vote_count += 1
+        if self.vote_count >= len(ids_of_replicas) / 2:
+            self.current_leader = self.id
+            self.state = LEADER
+            self.vote_count = 0
+        
+            # Now, this replica is the leader and sends the initial append entries
+            if self.current_leader == self.id and self.state == LEADER:
+                for id_replica in ids_of_replicas:
+                    append_entries_message = {
+                        'src': self.id,
+                        'dst': id_replica,
+                        'type': 'app_rpc',
+                        'leader': self.current_leader,
+                        'term': self.current_term,
+                        "key": '',  
+                        "value": ''
+                    }
+                    # Serialize and send the message directly here
+                    message_encoded = json.dumps(append_entries_message).encode('utf-8')
+                    self.socket.sendto(message_encoded, ('localhost', self.port))
+
+    # Responds to a vote rejection message during an election.
+    def process_vote_rejection(self, rejection_info):
+        # Only process the rejection if in CANDIDATE state and the term is outdated
+        should_process_rejection = (self.state == CANDIDATE and 
+                                rejection_info['term'] >= self.current_term)
+    
+        if should_process_rejection:
+            # Update current term to the term in the rejection message
+            self.current_term = rejection_info['term']
+
+            # Transition to FOLLOWER state as other node's term is higher or equal
+            self.state = FOLLOWER
+
+            # Reset voting attributes since the election term has changed
+            self.vote_count = 0
+            self.voted_for_this_term = ''
+
+            # Accept the leader ID provided in the rejection message
+            self.current_leader = rejection_info['leader']
+
+    #  Applies entries replicated from the leader to the local state machine or updates leadership information based on received heartbeats.
+    def apply_replicated_entries(self, entry_details):
+        if entry_details['key'] == '' or entry_details['value'] == '':
+            self.voted_for_this_term = ''
+            if self.current_leader == 'FFFF' or not self.current_leader == entry_details['leader']:
+                self.current_leader = entry_details['leader']
+        else:
+            self.kv_store[entry_details['key']] = entry_details['value']
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
